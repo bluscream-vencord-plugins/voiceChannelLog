@@ -1,6 +1,12 @@
-import { ChannelStore, GuildChannelStore } from "@webpack/common";
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 import type { Channel } from "@vencord/discord-types";
 import { ChannelType } from "@vencord/discord-types/enums";
+import { ChannelStore, GuildChannelStore } from "@webpack/common";
 
 export const isVoiceChannel = (channel: Channel | null | undefined): channel is Channel =>
     channel?.type === ChannelType.GUILD_VOICE || channel?.type === ChannelType.GUILD_STAGE_VOICE;

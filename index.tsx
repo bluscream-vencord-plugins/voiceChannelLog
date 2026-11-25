@@ -1,16 +1,22 @@
-//// Plugin originally written for Equicord at 2026-02-16 by https://github.com/Bluscream, https://antigravity.google
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+// // Plugin originally written for Equicord at 2026-02-16 by https://github.com/Bluscream, https://antigravity.google
 // region Imports
-import { ChannelStore, GuildStore, SelectedChannelStore, UserStore, } from "@webpack/common";
 import { sendBotMessage } from "@api/Commands";
 import { Logger } from "@utils/Logger";
 import definePlugin from "@utils/types";
+import { ChannelStore, GuildStore, SelectedChannelStore, UserStore, } from "@webpack/common";
 
-import { settings } from "./settings";
-import { findAssociatedTextChannel } from "./utils/channels";
-import { PreviousVoiceState } from "./types/PreviousVoiceState";
-import { VoiceStateChangeEvent } from "./types/VoiceStateChangeEvent";
 // endregion Imports
 import { pluginInfo } from "./info";
+import { settings } from "./settings";
+import { PreviousVoiceState } from "./types/PreviousVoiceState";
+import { VoiceStateChangeEvent } from "./types/VoiceStateChangeEvent";
+import { findAssociatedTextChannel } from "./utils/channels";
 export { pluginInfo };
 // region Utils
 function getTypeAndChannelId(
