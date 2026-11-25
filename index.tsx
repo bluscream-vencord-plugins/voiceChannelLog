@@ -4,457 +4,207 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-// // Plugin originally written for Equicord at 2026-02-16 by https://github.com/Bluscream, https://antigravity.google
-// region Imports
 import { sendBotMessage } from "@api/Commands";
 import { Logger } from "@utils/Logger";
+import { parseUrl } from "@utils/misc";
 import definePlugin from "@utils/types";
-import { ChannelStore, GuildStore, SelectedChannelStore, UserStore, } from "@webpack/common";
+import { Guild, User } from "@vencord/discord-types";
+import { AuthenticationStore, ChannelStore, GuildChannelStore, GuildStore, SelectedChannelStore, UserStore } from "@webpack/common";
 
-// endregion Imports
-import { pluginInfo } from "./info";
 import { settings } from "./settings";
-import { PreviousVoiceState } from "./types/PreviousVoiceState";
-import { VoiceStateChangeEvent } from "./types/VoiceStateChangeEvent";
-import { findAssociatedTextChannel } from "./utils/channels";
-export { pluginInfo };
-// region Utils
-function getTypeAndChannelId(
-    { channelId, oldChannelId }: VoiceStateChangeEvent,
-    isMe: boolean
-) {
-    // Track my last voice channel ID for proper move detection
-    if (isMe) {
-        if (channelId !== myLastVoiceChannelId) {
-            oldChannelId = myLastVoiceChannelId;
-            myLastVoiceChannelId = channelId;
-        }
-    }
 
-    if (channelId !== oldChannelId) {
-        // User connected to voice for the first time (no previous channel)
-        if (channelId && !oldChannelId) return ["connect", channelId];
-        // User disconnected from voice entirely (no new channel)
-        if (!channelId && oldChannelId) return ["disconnect", oldChannelId];
-        // User moved between channels (both channels exist)
-        if (channelId && oldChannelId) return ["move", channelId]; // Move from oldChannelId to channelId
-    }
+const PATTERNS = {
+    /** A template variable such as {username}. */
+    templateVariable: /\{(\w+)\}/g,
+    /** Line breaks separating the whitelisted server IDs. */
+    lineBreak: /\r?\n/,
+    /** Sender icons must be https. */
+    iconProtocol: "https:"
+};
 
-    return ["", ""];
+const logger = new Logger("VoiceChannelChatLog", "#7289da");
+
+interface VoiceStateChange {
+    userId: string;
+    sessionId?: string | null;
+    channelId?: string | null;
+    oldChannelId?: string | null;
+    deaf: boolean;
+    mute: boolean;
+    selfDeaf: boolean;
+    selfMute: boolean;
+    selfVideo: boolean;
+    selfStream?: boolean;
 }
 
-async function sendFormattedMessage(
-    messageTemplate: string,
-    voiceState: VoiceStateChangeEvent,
-    userId: string,
-    targetChannelId: string,
-    user: any,
-    guild?: any
-) {
-    if (!messageTemplate || messageTemplate.trim() === "") {
-        return;
-    }
+type Flags = Pick<VoiceStateChange, "deaf" | "mute" | "selfDeaf" | "selfMute" | "selfVideo" | "selfStream">;
+type Store = typeof settings.store;
+type EventKey = {
+    [K in keyof Store]: K extends `event${string}` ? K : never;
+}[keyof Store];
+type MessageKey = {
+    [K in keyof Store]: K extends `message${string}` ? K : never;
+}[keyof Store];
 
-    const now = new Date().toLocaleString();
-    const newVoiceChannel = voiceState.channelId
-        ? ChannelStore.getChannel(voiceState.channelId)
-        : null;
-    const oldVoiceChannel = voiceState.oldChannelId
-        ? ChannelStore.getChannel(voiceState.oldChannelId)
-        : null;
-
-    const message = messageTemplate
-        .replace(/{username}/g, user.username)
-        .replace(/{displayname}/g, user.globalName || user.username)
-        .replace(/{userid}/g, userId)
-        .replace(
-            /{oldChannelName}/g,
-            oldVoiceChannel?.name || "Unknown Channel"
-        )
-        .replace(/{oldChannelId}/g, voiceState.oldChannelId || "")
-        .replace(
-            /{newChannelName}/g,
-            newVoiceChannel?.name || "Unknown Channel"
-        )
-        .replace(/{newChannelId}/g, voiceState.channelId || "")
-        .replace(/{guildName}/g, guild?.name || "Unknown Guild")
-        .replace(/{guildId}/g, guild?.id || "")
-        .replace(/{now}/g, now);
-
-    try {
-        // Process template variables in author settings
-        const authorName = settings.store.authorName
-            .replace(/{username}/g, user.username)
-            .replace(/{displayname}/g, user.globalName || user.username)
-            .replace(/{userid}/g, userId);
-
-        const authorIconUrl = settings.store.authorIconUrl
-            .replace(/{username}/g, user.username)
-            .replace(/{displayname}/g, user.globalName || user.username)
-            .replace(/{userid}/g, userId)
-            .replace(/{avatar}/g, user.getAvatarURL?.() || "");
-
-        const authorConfig: { username: string; avatar_url?: string } = {
-            username: authorName,
-        };
-
-        if (authorIconUrl.trim()) {
-            authorConfig.avatar_url = authorIconUrl.trim();
-        }
-
-        sendBotMessage(targetChannelId, {
-            content: message,
-            author: authorConfig,
-        });
-    } catch (error) {
-        // Silently handle errors
-    }
+interface FlagRule {
+    changed(prev: Flags, next: Flags): boolean;
+    on(next: Flags): boolean;
+    onEvent: EventKey;
+    onMessage: MessageKey;
+    offEvent: EventKey;
+    offMessage: MessageKey;
 }
-// endregion Utils
-// region Variables
-let myLastVoiceChannelId: string | undefined;
-const previousVoiceStates = new Map<string, PreviousVoiceState>();
-const logger = new Logger(pluginInfo.id, pluginInfo.color);
-// endregion Variables
-// region Main
-// Function to detect and handle voice state changes
-async function detectVoiceStateChanges(
-    voiceState: VoiceStateChangeEvent,
-    userId: string,
-    isMe: boolean
-) {
-    const previousState = previousVoiceStates.get(userId);
 
-    // Log all voice state changes to console if enabled
-    if (settings.store.consoleLogging) {
-        logger.log(
-            `Voice state update for user ${userId}:`,
-            JSON.stringify(voiceState, null, 2)
-        );
-    }
+const FLAG_RULES: FlagRule[] = [
+    { changed: (p, n) => p.selfMute !== n.selfMute, on: n => n.selfMute, onEvent: "eventUserMuted", onMessage: "messageUserMuted", offEvent: "eventUserUnmuted", offMessage: "messageUserUnmuted" },
+    { changed: (p, n) => p.selfDeaf !== n.selfDeaf, on: n => n.selfDeaf, onEvent: "eventUserDeafens", onMessage: "messageUserDeafened", offEvent: "eventUserUndeafens", offMessage: "messageUserUndeafened" },
+    { changed: (p, n) => p.selfVideo !== n.selfVideo, on: n => n.selfVideo, onEvent: "eventUserCameraOn", onMessage: "messageUserCameraOn", offEvent: "eventUserCameraOff", offMessage: "messageUserCameraOff" },
+    { changed: (p, n) => !!p.selfStream !== !!n.selfStream, on: n => !!n.selfStream, onEvent: "eventUserStreamStart", onMessage: "messageUserStreamStart", offEvent: "eventUserStreamStop", offMessage: "messageUserStreamStop" },
+    { changed: (p, n) => p.mute !== n.mute && p.selfMute === n.selfMute, on: n => n.mute, onEvent: "eventUserServerMuted", onMessage: "messageUserServerMuted", offEvent: "eventUserServerUnmuted", offMessage: "messageUserServerUnmuted" },
+    { changed: (p, n) => p.deaf !== n.deaf && p.selfDeaf === n.selfDeaf, on: n => n.deaf, onEvent: "eventUserServerDeafened", onMessage: "messageUserServerDeafened", offEvent: "eventUserServerUndeafened", offMessage: "messageUserServerUndeafened" }
+];
 
-    // Skip my own events if triggerOnOwnEvents is disabled
-    if (!settings.store.triggerOnOwnEvents && isMe) {
-        return;
-    }
+let myLastVoiceChannelId: string | null = null;
+const previousVoiceStates = new Map<string, Flags>();
 
-    // Get current voice channel for filtering
-    const currentUserId = UserStore.getCurrentUser().id;
-    const myCurrentVoiceChannelId = SelectedChannelStore.getVoiceChannelId();
-    const currentChannelId = voiceState.channelId || voiceState.oldChannelId;
+function fill(template: string, values: Record<string, string>) {
+    return template.replace(PATTERNS.templateVariable, (match, key: string) => Object.hasOwn(values, key) ? values[key] : match);
+}
 
-    // If only monitoring own channel, skip events not related to my channel or selected channel
-    if (settings.store.onlyMonitorOwnChannel) {
-        const voiceChannel = currentChannelId ? ChannelStore.getChannel(currentChannelId) : null;
-        const guildId = voiceChannel?.guild_id;
-        const whitelistedGuilds = settings.store.whitelistedGuilds.split(/\r?\n/).map(id => id.trim()).filter(id => id.length > 0);
+function findAssociatedTextChannel(voiceChannelId: string) {
+    const voiceChannel = ChannelStore.getChannel(voiceChannelId);
+    if (!voiceChannel?.guild_id) return null;
+    const textChannel = GuildChannelStore.getFirstChannelOfType(
+        voiceChannel.guild_id,
+        ({ channel }) => channel.name === voiceChannel.name && channel.parent_id === voiceChannel.parent_id,
+        "SELECTABLE"
+    );
+    return textChannel?.id ?? voiceChannelId;
+}
 
-        if (!guildId || !whitelistedGuilds.includes(guildId)) {
-            const selectedChannelId = SelectedChannelStore.getChannelId();
-            if (
-                currentChannelId !== myCurrentVoiceChannelId &&
-                currentChannelId !== selectedChannelId
-            ) {
-                return;
-            }
-        }
-    }
+function post(store: Store, template: string, textChannelId: string | null, user: User, guild: Guild | undefined, newChannelId: string | null, oldChannelId: string | null) {
+    if (!textChannelId || !template.trim()) return;
 
-    // Get user information
-    const user = UserStore.getUser(userId);
-    if (!user) {
-        return;
-    }
+    const userValues = {
+        username: user.username,
+        displayname: user.globalName || user.username,
+        userid: user.id
+    };
+    const content = fill(template, {
+        ...userValues,
+        oldChannelName: (oldChannelId && ChannelStore.getChannel(oldChannelId)?.name) || "Unknown Channel",
+        oldChannelId: oldChannelId ?? "",
+        newChannelName: (newChannelId && ChannelStore.getChannel(newChannelId)?.name) || "Unknown Channel",
+        newChannelId: newChannelId ?? "",
+        guildName: guild?.name ?? "Unknown Guild",
+        guildId: guild?.id ?? "",
+        now: new Date().toLocaleString()
+    });
 
-    // Get voice channel and guild information
-    const voiceChannel = currentChannelId
-        ? ChannelStore.getChannel(currentChannelId)
-        : null;
-    const guildId = voiceChannel?.guild_id;
-    const guild = guildId ? GuildStore.getGuild(guildId) : null;
+    const author: { username: string; avatar_url?: string; } = { username: fill(store.authorName, userValues) };
+    const icon = fill(store.authorIconUrl, { ...userValues, avatar: user.getAvatarURL() }).trim();
+    if (icon && parseUrl(icon)?.protocol === PATTERNS.iconProtocol) author.avatar_url = icon;
 
-    // Get the text channel to send the message to
-    const targetTextChannelId = currentChannelId
-        ? findAssociatedTextChannel(currentChannelId)
-        : null;
-    if (!targetTextChannelId) {
-        return;
-    }
+    sendBotMessage(textChannelId, { content, author });
+}
 
-    const now = new Date().toLocaleString();
-
-    // Check for mute/unmute changes (self-mute)
-    if (previousState && previousState.selfMute !== voiceState.selfMute) {
-        if (voiceState.selfMute && settings.store.eventUserMuted) {
-            await sendFormattedMessage(
-                settings.store.messageUserMuted,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (!voiceState.selfMute && settings.store.eventUserUnmuted) {
-            await sendFormattedMessage(
-                settings.store.messageUserUnmuted,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for deafen/undeafen changes (self-deafen)
-    if (previousState && previousState.selfDeaf !== voiceState.selfDeaf) {
-        if (voiceState.selfDeaf && settings.store.eventUserDeafens) {
-            await sendFormattedMessage(
-                settings.store.messageUserDeafened,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (!voiceState.selfDeaf && settings.store.eventUserUndeafens) {
-            await sendFormattedMessage(
-                settings.store.messageUserUndeafened,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for camera on/off changes
-    if (previousState && previousState.selfVideo !== voiceState.selfVideo) {
-        if (voiceState.selfVideo && settings.store.eventUserCameraOn) {
-            await sendFormattedMessage(
-                settings.store.messageUserCameraOn,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (!voiceState.selfVideo && settings.store.eventUserCameraOff) {
-            await sendFormattedMessage(
-                settings.store.messageUserCameraOff,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for stream start/stop changes
-    if (previousState && previousState.selfStream !== voiceState.selfStream) {
-        if (voiceState.selfStream && settings.store.eventUserStreamStart) {
-            await sendFormattedMessage(
-                settings.store.messageUserStreamStart,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (
-            !voiceState.selfStream &&
-            settings.store.eventUserStreamStop
-        ) {
-            await sendFormattedMessage(
-                settings.store.messageUserStreamStop,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for server mute/unmute (mute field changes without self-mute changing)
-    if (
-        previousState &&
-        previousState.mute !== voiceState.mute &&
-        previousState.selfMute === voiceState.selfMute
-    ) {
-        if (voiceState.mute && settings.store.eventUserServerMuted) {
-            await sendFormattedMessage(
-                settings.store.messageUserServerMuted,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (!voiceState.mute && settings.store.eventUserServerUnmuted) {
-            await sendFormattedMessage(
-                settings.store.messageUserServerUnmuted,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for server deafen/undeafen (deaf field changes without self-deafen changing)
-    if (
-        previousState &&
-        previousState.deaf !== voiceState.deaf &&
-        previousState.selfDeaf === voiceState.selfDeaf
-    ) {
-        if (voiceState.deaf && settings.store.eventUserServerDeafened) {
-            await sendFormattedMessage(
-                settings.store.messageUserServerDeafened,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        } else if (
-            !voiceState.deaf &&
-            settings.store.eventUserServerUndeafened
-        ) {
-            await sendFormattedMessage(
-                settings.store.messageUserServerUndeafened,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Check for join/leave/move events
-    const [type, targetVoiceChannelId] = getTypeAndChannelId(voiceState, isMe);
-
-    if (type === "move" && settings.store.eventUserMoved) {
-        // Handle move events - post to both old and new channels
-        const newVoiceChannelId = voiceState.channelId;
-        const oldVoiceChannelId = voiceState.oldChannelId;
-
-        if (newVoiceChannelId && oldVoiceChannelId) {
-            // Post to old channel (leave message)
-            const oldChannelTextId =
-                findAssociatedTextChannel(oldVoiceChannelId);
-            if (oldChannelTextId) {
-                await sendFormattedMessage(
-                    settings.store.messageUserMoved,
-                    voiceState,
-                    userId,
-                    oldChannelTextId,
-                    user,
-                    guild
-                );
-            }
-
-            // Post to new channel (join message)
-            const newChannelTextId =
-                findAssociatedTextChannel(newVoiceChannelId);
-            if (newChannelTextId) {
-                await sendFormattedMessage(
-                    settings.store.messageUserMoved,
-                    voiceState,
-                    userId,
-                    newChannelTextId,
-                    user,
-                    guild
-                );
-            }
-        }
-    } else if (type) {
-        // Handle connect/disconnect events
-        let messageTemplate;
-        let shouldSend = false;
-
-        switch (type) {
-            case "join":
-                messageTemplate = settings.store.messageUserJoined;
-                shouldSend = settings.store.eventUserJoined;
-                break;
-            case "leave":
-                messageTemplate = settings.store.messageUserLeft;
-                shouldSend = settings.store.eventUserLeft;
-                break;
-            case "connect":
-                messageTemplate = settings.store.messageUserConnected;
-                shouldSend = settings.store.eventUserConnected;
-                break;
-            case "disconnect":
-                messageTemplate = settings.store.messageUserDisconnected;
-                shouldSend = settings.store.eventUserDisconnected;
-                break;
-            default:
-                messageTemplate = settings.store.messageUserDefault;
-                shouldSend = settings.store.eventUserDefault;
-        }
-
-        if (shouldSend) {
-            await sendFormattedMessage(
-                messageTemplate,
-                voiceState,
-                userId,
-                targetTextChannelId,
-                user,
-                guild
-            );
-        }
-    }
-
-    // Update the previous state for this user
-    previousVoiceStates.set(userId, {
-        deaf: voiceState.deaf,
-        mute: voiceState.mute,
-        selfDeaf: voiceState.selfDeaf,
-        selfMute: voiceState.selfMute,
-        selfVideo: voiceState.selfVideo,
-        selfStream: voiceState.selfStream,
+function isRelevant(store: Store, channelIds: (string | null)[], whitelist: Set<string>) {
+    if (!store.onlyMonitorOwnChannel) return true;
+    const mine = SelectedChannelStore.getVoiceChannelId();
+    const viewing = SelectedChannelStore.getChannelId();
+    return channelIds.some(id => {
+        if (!id) return false;
+        if (id === mine || id === viewing) return true;
+        const guildId = ChannelStore.getChannel(id)?.guild_id;
+        return !!guildId && whitelist.has(guildId);
     });
 }
 
-async function handleVoiceStateUpdate(voiceStates: VoiceStateChangeEvent[]) {
-    if (!settings.store.enabled) return;
+function handleVoiceState(state: VoiceStateChange, store: Store, myId: string, mySessionId: string, whitelist: Set<string>) {
+    const { userId } = state;
+    const channelId = state.channelId ?? null;
+    const isMe = userId === myId;
 
-    const currentUserId = UserStore.getCurrentUser().id;
+    let oldChannelId = state.oldChannelId ?? null;
+    if (isMe && state.sessionId === mySessionId) {
+        oldChannelId = myLastVoiceChannelId;
+        myLastVoiceChannelId = channelId;
+    }
 
-    for (const voiceState of voiceStates) {
-        const { userId } = voiceState;
-        const isMe = userId === currentUserId;
+    const previous = previousVoiceStates.get(userId);
+    if (channelId) {
+        previousVoiceStates.set(userId, {
+            deaf: state.deaf,
+            mute: state.mute,
+            selfDeaf: state.selfDeaf,
+            selfMute: state.selfMute,
+            selfVideo: state.selfVideo,
+            selfStream: state.selfStream
+        });
+    } else {
+        previousVoiceStates.delete(userId);
+    }
 
-        // Handle all voice state changes in one place
-        await detectVoiceStateChanges(voiceState, userId, isMe);
+    if (store.consoleLogging) logger.debug("Voice state update", { userId, channelId, oldChannelId });
+    if (isMe && !store.triggerOnOwnEvents) return;
+
+    const flagChanges = previous && channelId ? FLAG_RULES.filter(rule => rule.changed(previous, state)) : [];
+    const moved = channelId !== oldChannelId;
+    if (!moved && !flagChanges.length) return;
+    if (!isRelevant(store, [channelId, oldChannelId], whitelist)) return;
+
+    const user = UserStore.getUser(userId);
+    if (!user) return;
+    const guildId = ChannelStore.getChannel(channelId ?? oldChannelId ?? "")?.guild_id;
+    const guild = guildId ? GuildStore.getGuild(guildId) : undefined;
+
+    if (channelId) {
+        const textChannelId = findAssociatedTextChannel(channelId);
+        for (const rule of flagChanges) {
+            const on = rule.on(state);
+            if (store[on ? rule.onEvent : rule.offEvent])
+                post(store, store[on ? rule.onMessage : rule.offMessage], textChannelId, user, guild, channelId, oldChannelId);
+        }
+    }
+
+    if (!moved) return;
+    if (channelId && oldChannelId) {
+        if (!store.eventUserMoved) return;
+        post(store, store.messageUserMoved, findAssociatedTextChannel(oldChannelId), user, guild, channelId, oldChannelId);
+        post(store, store.messageUserMoved, findAssociatedTextChannel(channelId), user, guild, channelId, oldChannelId);
+    } else if (channelId) {
+        if (store.eventUserConnected) post(store, store.messageUserConnected, findAssociatedTextChannel(channelId), user, guild, channelId, null);
+    } else if (oldChannelId) {
+        if (store.eventUserDisconnected) post(store, store.messageUserDisconnected, findAssociatedTextChannel(oldChannelId), user, guild, null, oldChannelId);
     }
 }
-// endregion Main
-// region Definition
+
 export default definePlugin({
-    name: pluginInfo.name,
-    description: pluginInfo.description,
-    authors: pluginInfo.authors,
+    name: "VoiceChannelChatLog",
+    description: "Posts local messages in a voice channel's chat when people join, leave, move, mute, deafen, stream or turn on their camera.",
+    authors: [
+        { name: "Bluscream", id: 467777925790564352n },
+        { name: "b1uscr34m", id: 896443818935713853n },
+        { name: "Cursor.AI", id: 0n }
+    ],
     settings,
 
-    start() { },
+    start() {
+        myLastVoiceChannelId = SelectedChannelStore.getVoiceChannelId() ?? null;
+    },
+
+    stop() {
+        previousVoiceStates.clear();
+        myLastVoiceChannelId = null;
+    },
 
     flux: {
-        VOICE_STATE_UPDATES({
-            voiceStates,
-        }: {
-            voiceStates: VoiceStateChangeEvent[];
-        }) {
-            handleVoiceStateUpdate(voiceStates).catch(() => {
-                // Silently handle async errors
-            });
-        },
-    },
+        VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: VoiceStateChange[]; }) {
+            const store = settings.plain;
+            const myId = UserStore.getCurrentUser().id;
+            const mySessionId = AuthenticationStore.getSessionId();
+            const whitelist = new Set(store.whitelistedGuilds.split(PATTERNS.lineBreak).map(id => id.trim()).filter(Boolean));
+            for (const state of voiceStates) handleVoiceState(state, store, myId, mySessionId, whitelist);
+        }
+    }
 });
-// endregion Definition

@@ -1,52 +1,25 @@
-# Vencord Voice Channel Logging Plugin
+# VoiceChannelChatLog
 
-A Vencord user plugin that logs voice channel joins and leaves to the associated text channel.
+Equicord user plugin: posts local messages in a voice channel's chat when people connect, disconnect, move, mute, deafen, stream, turn their camera on or off, or get muted or deafened by the server.
 
-## Features
+The messages are local only, like Clyde messages. Nothing is sent to Discord, and nobody else sees them.
 
-- **Voice Channel Logging**: Automatically logs when users join or leave voice channels
-- **Text Channel Integration**: Sends logs to the text channel associated with the voice channel
-- **Customizable Messages**: Configure custom message formats for join and leave events with multiple placeholders
-- **Selective Monitoring**: Option to only monitor your current voice channel
-- **Debug Logging**: Comprehensive debug logging with file export capability
-- **Bot-like Appearance**: Messages appear as if sent by Clyde
+## How it differs from the built-in VoiceChannelLog
 
-## Event Types
+Equicord's built-in VoiceChannelLog keeps a log you open from the voice channel. This plugin instead writes each event into the voice channel's text chat (or a text channel with the same name in the same category), with message templates you can change.
 
-The plugin distinguishes between different types of voice events:
+## Settings
 
-- **Join**: User moves from one voice channel to another (or joins from no channel)
-- **Leave**: User moves from a voice channel to another (or leaves to no channel)
-- **Connect**: User connects to voice for the first time (no previous channel)
-- **Disconnect**: User disconnects from voice entirely (no new channel)
-- **Moved**: User moves between voice channels (when not monitoring own channel)
-- **Mute/Unmute**: User mutes or unmutes themselves
-- **Deafen/Undeafen**: User deafens or undeafens themselves
-- **Camera On/Off**: User enables or disables their camera
-- **Stream Start/Stop**: User starts or stops streaming
-- **Server Mute/Unmute**: User gets muted or unmuted by server/admin
-- **Server Deafen/Undeafen**: User gets deafened or undeafened by server/admin
+- **Only monitor own channel**: only log events in the voice channel you're in or the channel you're viewing. Servers listed under whitelisted servers are always logged.
+- **Trigger on own events**: also log your own events. Only this Discord window counts as "you" for connect, move and disconnect.
+- **Event toggles and message templates**: one pair per event. Templates can use `{username}`, `{displayname}`, `{userid}`, `{oldChannelName}`, `{oldChannelId}`, `{newChannelName}`, `{newChannelId}`, `{guildName}`, `{guildId}` and `{now}`.
+- **Sender name and icon**: the name and icon shown on the messages. The icon must be an https address, or `{avatar}` for the user's avatar.
 
-## Installation
+## Install
 
-### 🪄 Installation Wizard
-The easiest way to install this plugin is to use the **[Plugin Installer Generator](https://bluscream-vencord-plugins.github.io)**.
-Simply select this plugin from the list and download your custom install script.
-
-### 💻 Manual Installation (PowerShell)
-Alternatively, you can run this snippet in your Equicord/Vencord source directory:
-```powershell
-$ErrorActionPreference = "Stop"
-winget install -e --id Git.Git
-winget install -e --id OpenJS.NodeJS
-npm install -g pnpm
-git clone https://github.com/Equicord/Equicord Equicord
-New-Item -ItemType Directory -Force -Path "Equicord\src\userplugins" | Out-Null
-git clone https://github.com/bluscream-vencord-plugins/voiceChannelLog.git -b "main" "Equicord\src\userplugins\voiceChannelLog"
-cd "Equicord"
-npm install -g pnpm
-pnpm install --frozen-lockfile
-pnpm build
-pnpm buildWeb
-pnpm inject
+```sh
+cd src/userplugins
+git clone https://github.com/bluscream-vencord-plugins/voiceChannelLog
 ```
+
+Rebuild Equicord and enable VoiceChannelChatLog. Update with `git pull`.
